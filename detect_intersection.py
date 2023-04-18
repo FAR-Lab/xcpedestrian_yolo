@@ -1,5 +1,6 @@
 import random
 import time
+import copy
 from pathlib import Path
 
 import cv2
@@ -12,6 +13,7 @@ from utils.general import (set_logging, check_img_size, non_max_suppression,
                            scale_coords, xyxy2xywh, increment_path)
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, time_synchronized
+from ultralytics import YOLO
 
 
 class Pipeline(object):
@@ -58,48 +60,50 @@ class Pipeline(object):
         set_logging()
         self.device = select_device(self.device)
         self.half = self.device.type != 'cpu'  # half precision only supported on CUDA
+        self.names = []
+        self.colors = []
 
-        # Load model
-        self.load_model()
-        self.stride = int(self.model.stride.max())  # model stride
+        # Load default model
+        self.load_default_model()
+        self.stride = int(self.default_model.stride.max())  # model stride
         self.img_size = check_img_size(
             self.img_size, s=self.stride)  # check img_size
-
         # Get names and colors
-        self.names = self.model.module.names if hasattr(
-            self.model, 'module') else self.model.names
-        self.colors = [[random.randint(0, 255)
-                        for _ in range(3)] for _ in self.names]
+        self.names.append(self.default_model.module.names if hasattr(
+            self.default_model, 'module') else self.default_model.names)
+        self.colors.append([[random.randint(0, 255)
+                            for _ in range(3)] for _ in self.default_model.names])
+
+        # load crosswalk model
+        self.crosswalk_model = YOLO("crosswalk.pt")
+        self.names.append(["crosswalk"])
+        self.colors.append([[random.randint(0, 255) for _ in range(3)]])
 
         # load dataset
         self.dataset = self.load_dataset()
-        self.img = list(self.dataset)[0]
 
         # Run inference
         if self.device.type != 'cpu':
             self.run_inference()
 
         # predict
-        self.predict_elements()
+        for c, (path, img, im0s, vid_cap) in enumerate(self.dataset):
+            preds = []
+            preds.append(self.predict_elements(c, img, im0s))
+            preds.append(self.predict_crosswalk(c, img, im0s))
+            self.save_result(preds, path, im0s, vid_cap)
 
     def load_dataset(self):
         dataset = LoadImages(self.source, img_size=self.img_size)
         return dataset
 
-    def load_model(self):
-        self.model = attempt_load(
+    def load_default_model(self):
+        self.default_model = attempt_load(
             self.weights, map_location=self.device)  # load FP32 model
 
     def run_inference(self):
-        self.model(torch.zeros(1, 3, self.img_size, self.img_size).to(
-            self.device).type_as(next(self.model.parameters())))  # run once
-
-        # Warmup
-        old_img_w = old_img_h = self.img_size
-        old_img_b = 1
-        if old_img_b != self.img.shape[0] or old_img_h != self.img.shape[2] or old_img_w != self.img.shape[3]:
-            for _ in range(3):
-                self.model(self.img, augment=self.augment)[0]
+        self.default_model(torch.zeros(1, 3, self.img_size, self.img_size).to(
+            self.device).type_as(next(self.default_model.parameters())))  # run once
 
     def remove_shadow(self, img):
         return img
@@ -113,68 +117,120 @@ class Pipeline(object):
             img = img.unsqueeze(0)
         return img
 
-    def predict_elements(self):
-        t0 = time.time()
-        for path, img, im0s, vid_cap in self.dataset:
-            img = self.img_preprocess(img)
+    def predict_elements(self, cc, img, im0s):
+        img = copy.deepcopy(img)
+        img = self.img_preprocess(img)
 
-            # Inference
-            t1 = time_synchronized()
-            pred = self.model(img, augment=self.augment)[0]
-            t2 = time_synchronized()
+        # Inference
+        t1 = time_synchronized()
+        pred = self.default_model(img, augment=self.augment)[0]
+        t2 = time_synchronized()
 
-            # Apply NMS
-            pred = non_max_suppression(
-                pred, self.conf_thres, self.iou_thres, classes=[0, 1, 2, 3, 5, 9, 11], agnostic=self.agnostic_nms)
-            t3 = time_synchronized()
+        # Apply NMS
+        pred = non_max_suppression(
+            pred, self.conf_thres, self.iou_thres, classes=[0, 1, 2, 3, 5, 9, 11], agnostic=self.agnostic_nms)
+        t3 = time_synchronized()
 
-            # Process detections
-            for i, det in enumerate(pred):  # detections per image
+        s = ""
+        # Process detections
+        for i, det in enumerate(pred):  # detections per image
+            if len(det):
+                # Rescale boxes from img_size to im0 size
+                im0 = im0s[i] if self.webcam else im0s
+                det[:, :4] = scale_coords(
+                    img.shape[2:], det[:, :4], im0.shape).round()
+
+                # Print results
+                for c in det[:, -1].unique():
+                    n = (det[:, -1] == c).sum()  # detections per class
+                    # add to string
+                    s += f"{n} {self.names[0][int(c)]}{'s' * (n > 1)}, "
+            else:
+                s = "No elements detected,"
+
+        # Print time (inference + NMS)
+        print(
+            f'[{cc}/{len(self.dataset)}] {s}Predict elements done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+
+        return pred
+
+    def predict_crosswalk(self, cc, img, im0s):
+        img = copy.deepcopy(img)
+
+        # Inference
+        t1 = time_synchronized()
+        results = self.crosswalk_model(img.transpose(1, 2, 0))[0]
+        t2 = time_synchronized()
+
+        # Convert to numpy
+        pred = []
+        for box in results.boxes:
+            if box.conf < self.conf_thres:
+                continue
+            pred.append([box.xyxy[0].tolist() + [float(box.conf), 0]])
+        pred = torch.tensor(pred)
+
+        # Apply NMS
+        # pred = non_max_suppression(
+        #   pred, self.conf_thres, self.iou_thres, classes=None, agnostic=self.agnostic_nms)
+        t3 = time_synchronized()
+
+        s = ""
+        # Process detections
+        for i, det in enumerate(pred):  # detections per image
+            if len(det):
+                # Rescale boxes from img_size to im0 size
+                im0 = im0s[i] if self.webcam else im0s
+                det[:, :4] = scale_coords(
+                    img.shape[1:], det[:, :4], im0.shape).round()
+
+                # Print results
+                for c in det[:, -1].unique():
+                    n = (det[:, -1] == c).sum()  # detections per class
+                    # add to string
+                    s += f"{n} {self.names[1][int(c)]}{'s' * (n > 1)}, "
+            else:
+                "No crosswalk detected."
+
+        # Print time (inference + NMS)
+        print(
+            f'[{cc}/{len(self.dataset)}]  {s}Predict elements done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+
+        return pred
+
+    def save_result(self, preds, path, im0s, vid_cap):
+        for pp, pred in enumerate(preds):
+            for i, det in enumerate(pred):
                 if self.webcam:  # batch_size >= 1
-                    p, s, im0, frame = path[i], '%g: ' % i, im0s[i].copy(
-                    ), self.dataset.count
+                    p, im0, frame = path[i], im0s[i].copy(), self.dataset.count
                 else:
-                    p, s, im0, frame = path, '', im0s, getattr(
+                    p, im0, frame = path, im0s, getattr(
                         self.dataset, 'frame', 0)
 
                 p = Path(p)  # to Path
                 save_path = str(self.save_dir / p.name)  # img.jpg
                 txt_path = str(self.save_dir / 'labels' / p.stem) + \
                     ('' if self.dataset.mode ==
-                     'image' else f'_{frame}')  # img.txt
-                # normalization gain whwh
+                        'image' else f'_{frame}')  # img.txt
+
                 gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
-                if len(det):
-                    # Rescale boxes from img_size to im0 size
-                    det[:, :4] = scale_coords(
-                        img.shape[2:], det[:, :4], im0.shape).round()
+                # Write results
+                # normalization gain whwh
+                for *xyxy, conf, cls in reversed(det):
+                    if self.save_txt:  # Write to file
+                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(
+                            1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                        # label format
+                        line = (
+                            cls, *xywh, conf) if self.save_conf else (cls, *xywh)
+                        with open(txt_path + '.txt', 'a') as f:
+                            f.write(('%g ' * len(line)).rstrip() %
+                                    line + '\n')
 
-                    # Print results
-                    for c in det[:, -1].unique():
-                        n = (det[:, -1] == c).sum()  # detections per class
-                        # add to string
-                        s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "
-
-                    # Write results
-                    for *xyxy, conf, cls in reversed(det):
-                        if self.save_txt:  # Write to file
-                            xywh = (xyxy2xywh(torch.tensor(xyxy).view(
-                                1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                            # label format
-                            line = (
-                                cls, *xywh, conf) if self.save_conf else (cls, *xywh)
-                            with open(txt_path + '.txt', 'a') as f:
-                                f.write(('%g ' * len(line)).rstrip() %
-                                        line + '\n')
-
-                        if self.save_img or self.view_img:  # Add bbox to image
-                            label = f'{self.names[int(cls)]} {conf:.2f}'
-                            plot_one_box(xyxy, im0, label=label,
-                                         color=self.colors[int(cls)], line_thickness=1)
-
-                # Print time (inference + NMS)
-                print(
-                    f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+                    if self.save_img or self.view_img:  # Add bbox to image
+                        label = f'{self.names[pp][int(cls)]} {conf:.2f}'
+                        plot_one_box(xyxy, im0, label=label,
+                                     color=self.colors[pp][int(cls)], line_thickness=1)
 
                 # Stream results
                 if self.view_img:
@@ -206,8 +262,6 @@ class Pipeline(object):
         if self.save_txt or self.save_img:
             s = f"\n{len(list(self.save_dir.glob('labels/*.txt')))} labels saved to {self.save_dir / 'labels'}" if self.save_txt else ''
             # print(f"Results saved to {save_dir}{s}")
-
-        print(f'Done. ({time.time() - t0:.3f}s)')
 
 
 if __name__ == '__main__':
