@@ -491,9 +491,10 @@ class Intersection:
             "bicycle": 0.4772582269590735,
             "bus": 1.9100436819742963,
             "motorcycle": 0.2392703359735101,
-            "trafficlight": 1.8459140771948266,
+            "traffic_light": 1.8459140771948266,
             "R_Signal": 0.12295418615641256,
-            "stopsign": -0.45393678624340095}
+            "stop_sign": -0.45393678624340095
+        }
         b = -4.909474292254606
 
         def logistic_regression(x):
