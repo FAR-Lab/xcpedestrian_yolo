@@ -506,24 +506,26 @@ class Intersection:
         df["prob"] = df.apply(logistic_regression, axis=1)
 
         # add buffer and smoothing to prediction
+        # using moving average
         if buffer > 0 or seconds > 1:
             frames_to_buffer = fps * buffer
-            frames_threshold = fps * seconds
+            frames_range = fps * seconds
+            frames_thres = frames_range * thres
             probs = df["prob"].values
-            i = 0
             intervals = []
-            count = 0
+            moving_sum = 0
             for i in range(len(df)):
                 # actively seaking first pred > thres and count > frames_threshold
-                if probs[i] >= thres:
-                    count += 1
-                else:
-                    count = 0
-                if count >= frames_threshold:
+                moving_sum += probs[i]
+
+                if i - frames_range >= 0:
+                    moving_sum -= probs[i - frames_range]
+
+                if moving_sum >= frames_thres:
                     end = min(i + frames_to_buffer, len(df) - 1)
                     if len(intervals) == 0 or intervals[-1][-1] < i - frames_to_buffer:
                         intervals.append(
-                            [max(i - frames_threshold - frames_to_buffer, 0), end])
+                            [max(i - frames_range - frames_to_buffer, 0), end])
                     else:
                         intervals[-1][-1] = end
 
